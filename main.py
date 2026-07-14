@@ -5,12 +5,20 @@ import time
 import threading
 import tkinter as tk
 from tkinter import filedialog
+import argparse
 
 from core.background import BackgroundModel
 from core.custom_background import CustomBackground
 from core.virtual_cam import VirtualCamOutput
+from core.video_capture import ThreadedVideoCapture
 from core.zoom import ZoomController
 from core.ar_canvas import ARCanvas
+from core.compositor import (
+    make_person_mask, invalidate_bg_cache,
+    apply_virtual_background, apply_full_invisibility,
+    apply_portal_invisibility, apply_background_blur,
+    apply_focus_window
+)
 from vision.hand_tracker import HandTracker
 from vision.portal_detector import PortalDetector
 from vision.gesture import GestureController
@@ -22,156 +30,6 @@ from ar.overlay_factory import OverlayFactory
 from ar.ar_renderer import ARRenderer
 
 
-# ─────────────────────────────────────────────────────────────────────
-focus_points = []
-MODES = ["PORTAL", "FULL", "BLUR"]   # mode cycle
-
-
-def mouse_callback(event, x, y, flags, param):
-    global focus_points
-    if event == cv2.EVENT_LBUTTONDOWN:
-        if len(focus_points) < 4:
-            focus_points.append((x, y))
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Segmentation & masking
-# ─────────────────────────────────────────────────────────────────────
-
-def make_person_mask(segmenter, frame):
-    """
-    Returns (hard uint8 0/255, soft float32 0-1) person mask.
-    Runs at HALF resolution internally for ~4× speedup, then upscales.
-    """
-    fh, fw = frame.shape[:2]
-    small  = cv2.resize(frame, (fw // 2, fh // 2))
-    rgb    = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-    result = segmenter.process(rgb)
-
-    raw = (result.segmentation_mask > 0.55).astype(np.uint8)
-
-    k7 = np.ones((7, 7), np.uint8)
-    k3 = np.ones((3, 3), np.uint8)
-    cleaned = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, k7)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,  k3)
-
-    hard_full = cv2.resize(
-        (cleaned * 255).astype(np.uint8), (fw, fh),
-        interpolation=cv2.INTER_NEAREST
-    )
-    soft_small = cv2.GaussianBlur(cleaned.astype(np.float32), (21, 21), 0)
-    soft_full  = cv2.resize(soft_small, (fw, fh),
-                            interpolation=cv2.INTER_LINEAR)
-    soft_full  = np.clip(soft_full * 1.5, 0.0, 1.0)
-
-    return hard_full, soft_full
-
-
-# ── Light-match cache ─────────────────────────────────────────────────
-_bg_light_cache = None
-_bg_light_tick  = 0
-_BG_LIGHT_INTERVAL = 6
-
-
-def invalidate_bg_cache():
-    global _bg_light_cache, _bg_light_tick
-    _bg_light_cache = None
-    _bg_light_tick  = 0
-
-
-def match_background_light(background, frame):
-    """Per-channel brightness correction, cached every N frames."""
-    global _bg_light_cache, _bg_light_tick
-    _bg_light_tick += 1
-    if _bg_light_cache is None or _bg_light_tick % _BG_LIGHT_INTERVAL == 0:
-        bg   = background.astype(np.float32)
-        live = frame.astype(np.float32)
-        for c in range(3):
-            bg[:, :, c] += (live[:, :, c].mean() - bg[:, :, c].mean())
-        _bg_light_cache = np.clip(bg, 0, 255).astype(np.uint8)
-    return _bg_light_cache
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Compositing functions
-# ─────────────────────────────────────────────────────────────────────
-
-def apply_virtual_background(frame, bg_frame, soft_mask):
-    """
-    Zoom / Teams -style virtual background:
-    Person stays fully visible; everything outside is replaced by bg_frame.
-    soft_mask: 1.0 = person, 0.0 = background.
-    """
-    alpha  = soft_mask[:, :, np.newaxis]
-    output = (frame.astype(np.float32) * alpha
-              + bg_frame.astype(np.float32) * (1.0 - alpha))
-    return np.clip(output, 0, 255).astype(np.uint8)
-
-
-def apply_full_invisibility(frame, background, soft_mask):
-    """Person becomes invisible — background shows everywhere."""
-    corrected_bg = match_background_light(background, frame)
-    alpha  = soft_mask[:, :, np.newaxis]
-    # Person area → bg (person invisible), bg area → live frame
-    output = (corrected_bg.astype(np.float32) * alpha
-              + frame.astype(np.float32) * (1.0 - alpha))
-    return np.clip(output, 0, 255).astype(np.uint8)
-
-
-def apply_portal_invisibility(frame, background, portal,
-                               soft_mask=None):
-    """Portal rectangle shows background behind the person."""
-    if portal is None:
-        return frame.copy()
-
-    corrected_bg = match_background_light(background, frame)
-    output = frame.copy()
-
-    x1, y1, x2, y2 = portal
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(frame.shape[1] - 1, x2), min(frame.shape[0] - 1, y2)
-
-    if soft_mask is not None:
-        region_alpha = soft_mask[y1:y2, x1:x2, np.newaxis]
-        region_bg    = corrected_bg[y1:y2, x1:x2].astype(np.float32)
-        region_frame = output[y1:y2, x1:x2].astype(np.float32)
-        blended = (region_bg * region_alpha
-                   + region_frame * (1.0 - region_alpha))
-        output[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
-    else:
-        output[y1:y2, x1:x2] = corrected_bg[y1:y2, x1:x2]
-
-    return output
-
-
-def apply_background_blur(frame, soft_mask, blur_strength: int = 31):
-    """Teams-style background blur — person sharp, background blurred."""
-    k       = max(1, blur_strength) | 1
-    blurred = cv2.GaussianBlur(frame, (k, k), 0)
-    alpha   = soft_mask[:, :, np.newaxis]
-    output  = (frame.astype(np.float32) * alpha
-               + blurred.astype(np.float32) * (1.0 - alpha))
-    return np.clip(output, 0, 255).astype(np.uint8)
-
-
-def apply_focus_window(frame, background, box):
-    """Outside the focus box → replaced with background."""
-    if box is None:
-        return frame
-
-    corrected_bg = match_background_light(background, frame)
-    x1, y1, x2, y2 = box
-
-    mask   = np.zeros(frame.shape[:2], dtype=np.uint8)
-    cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-    mask   = cv2.GaussianBlur(mask, (41, 41), 0)
-    mask3d = mask[:, :, np.newaxis].astype(np.float32) / 255.0
-
-    output = (frame.astype(np.float32) * mask3d
-              + corrected_bg.astype(np.float32) * (1.0 - mask3d))
-    return output.astype(np.uint8)
-
-
 def flip_corners_for_mirror(corners, frame_width):
     if corners is None:
         return None
@@ -181,396 +39,308 @@ def flip_corners_for_mirror(corners, frame_width):
                        dtype=np.float32)
     return flipped
 
+class RealityFrameApp:
+    def __init__(self, camera_index=0):
+        self.focus_points = []
+        self.MODES = ["PORTAL", "FULL", "BLUR"]
+        self.mode_idx = 0
+        self.invisible_mode = self.MODES[self.mode_idx]
+        
+        self.blur_strength = 31
+        self.zoom_enabled = True
+        
+        self.focus_mode = False
+        self.focus_box = None
+        self.selecting_focus = False
+        
+        self.ar_mode = False
+        self.show_tracking_frame = False
+        
+        self.fps_counter = 0
+        self.fps_display = 0
+        self.fps_timer = time.time()
+        
+        self.bg_prompt_active = False
 
-# ─────────────────────────────────────────────────────────────────────
-#  Custom background — native file-picker dialog
-# ─────────────────────────────────────────────────────────────────────
+        self.cap = ThreadedVideoCapture(camera_index)
 
-_bg_prompt_active = False
+        self.actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Setup window
+        cv2.namedWindow("RealityFrame")
+        cv2.setMouseCallback("RealityFrame", self.mouse_callback)
 
+        # Components
+        self.background_model = BackgroundModel()
+        self.background_model.capture(self.cap, frames_count=180)
+        self.background = self.background_model.get()
 
-def _open_bg_picker(custom_bg: CustomBackground, renderer: Renderer):
-    """Native file-picker dialog (runs in daemon thread)."""
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
+        self.hand_tracker = HandTracker()
+        self.portal_detector = PortalDetector()
+        self.gesture = GestureController()
+        self.renderer = Renderer()
+        self.zoom_ctrl = ZoomController()
+        self.custom_bg = CustomBackground()
+        self.vcam = VirtualCamOutput(self.actual_w, self.actual_h, fps=30)
+        self.canvas = ARCanvas()
+        self.pose_tracker = PoseTracker()
 
-    filetypes = [
-        ("All supported",
-         "*.jpg *.jpeg *.png *.bmp *.webp *.tiff "
-         "*.mp4 *.avi *.mov *.mkv *.webm"),
-        ("Images",  "*.jpg *.jpeg *.png *.bmp *.webp *.tiff"),
-        ("Videos",  "*.mp4 *.avi *.mov *.mkv *.webm"),
-        ("All files", "*.*"),
-    ]
+        self.target_tracker = TargetTracker(marker_id=0)
+        self.ar_overlay = OverlayFactory.creeper_face(size=700)
+        self.ar_renderer_obj = ARRenderer(self.ar_overlay)
 
-    path = filedialog.askopenfilename(
-        title     = "Select Background Image or Video",
-        filetypes = filetypes,
-    )
-    root.destroy()
+        self.mp_hands_mod = mp.solutions.hands
+        self.mp_draw = mp.solutions.drawing_utils
 
-    if path:
-        ok = custom_bg.set_source(path)
-        invalidate_bg_cache()          # ← clear stale light-match cache
-        renderer.push_toast(
-            f"BG: {custom_bg.source_name}" if ok else "Could not load file"
-        )
-    else:
-        renderer.push_toast("No file selected")
+    def mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if len(self.focus_points) < 4:
+                self.focus_points.append((x, y))
 
+    def _open_bg_picker(self):
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
 
-# ─────────────────────────────────────────────────────────────────────
-#  Main loop
-# ─────────────────────────────────────────────────────────────────────
+        filetypes = [
+            ("All supported", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.mp4 *.avi *.mov *.mkv *.webm"),
+            ("Images", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff"),
+            ("Videos", "*.mp4 *.avi *.mov *.mkv *.webm"),
+            ("All files", "*.*"),
+        ]
+        path = filedialog.askopenfilename(title="Select Background Image or Video", filetypes=filetypes)
+        root.destroy()
 
-def main():
-    global focus_points, _bg_prompt_active
+        if path:
+            ok = self.custom_bg.set_source(path)
+            invalidate_bg_cache()
+            self.renderer.push_toast(f"BG: {self.custom_bg.source_name}" if ok else "Could not load file")
+        else:
+            self.renderer.push_toast("No file selected")
+            
+        self.bg_prompt_active = False
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Camera not found")
-        return
+    def run(self):
+        mp_selfie = mp.solutions.selfie_segmentation
+        with mp_selfie.SelfieSegmentation(model_selection=1) as segmenter:
+            while True:
+                ret, raw_frame = self.cap.read()
+                if not ret or raw_frame is None:
+                    time.sleep(0.01)
+                    continue
+                
+                raw_h, raw_w = raw_frame.shape[:2]
+                frame = cv2.flip(raw_frame, 1)
+                h, w = frame.shape[:2]
 
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+                self.fps_counter += 1
+                if time.time() - self.fps_timer >= 1.0:
+                    self.fps_display = self.fps_counter
+                    self.fps_counter = 0
+                    self.fps_timer = time.time()
 
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                hands = self.hand_tracker.find_hands(frame)
+                triggered_gesture = None
+                landmarks = self.pose_tracker.update(frame, every_n=2)
 
-    cv2.namedWindow("RealityFrame")
-    cv2.setMouseCallback("RealityFrame", mouse_callback)
+                if self.canvas.draw_mode:
+                    pointing = self.gesture.pointing_hand(hands)
+                    if pointing is not None:
+                        tip = pointing.landmark[8]
+                        self.canvas.pen_at(int(tip.x * w), int(tip.y * h))
+                    elif self.gesture.fist_any(hands):
+                        self.canvas.pen_up()
+                else:
+                    if self.gesture.two_hand_pinch_triggered(hands):
+                        self.mode_idx = (self.mode_idx + 1) % len(self.MODES)
+                        self.invisible_mode = self.MODES[self.mode_idx]
+                        self.renderer.push_toast(f"Mode  {self.invisible_mode}")
+                        triggered_gesture = "PINCH"
 
-    # ── Background capture ────────────────────────────────────────────
-    background_model = BackgroundModel()
-    background_model.capture(cap, frames_count=180)
-    background = background_model.get()
+                    if self.gesture.peace_triggered(hands):
+                        if not self.selecting_focus:
+                            self.selecting_focus = True
+                            self.focus_points.clear()
+                            self.renderer.push_toast("Draw Focus Region - 4 clicks")
+                        triggered_gesture = "PEACE V"
 
-    # ── Initialise components ─────────────────────────────────────────
-    hand_tracker    = HandTracker()
-    portal_detector = PortalDetector()
-    gesture         = GestureController()
-    renderer        = Renderer()
-    zoom_ctrl       = ZoomController()
-    custom_bg       = CustomBackground()
-    vcam            = VirtualCamOutput(actual_w, actual_h, fps=30)
-    canvas          = ARCanvas()
-    pose_tracker    = PoseTracker()
+                    if triggered_gesture:
+                        self.renderer.flash_gesture()
 
-    target_tracker  = TargetTracker(marker_id=0)
-    ar_overlay      = OverlayFactory.creeper_face(size=700)
-    ar_renderer_obj = ARRenderer(ar_overlay)
+                    if self.zoom_enabled:
+                        zoom_level = self.zoom_ctrl.update(hands)
+                    else:
+                        zoom_level = 1.0
 
-    mp_hands_mod = mp.solutions.hands
-    mp_draw      = mp.solutions.drawing_utils
+                portal = self.portal_detector.detect(hands, frame.shape)
 
-    # ── State ─────────────────────────────────────────────────────────
-    mode_idx        = 0
-    invisible_mode  = MODES[mode_idx]
+                need_mask = (self.invisible_mode in ("FULL", "BLUR")
+                             or (self.invisible_mode == "PORTAL" and portal is not None)
+                             or self.custom_bg.enabled)
 
-    blur_strength   = 31
-    zoom_enabled    = True       # toggle with Z
-    blur_in_cycle   = True       # BLUR appears in mode cycle
+                if need_mask:
+                    hard_mask, soft_mask = make_person_mask(segmenter, frame)
+                else:
+                    hard_mask = np.zeros((h, w), dtype=np.uint8)
+                    soft_mask = np.zeros((h, w), dtype=np.float32)
 
-    focus_mode      = False
-    focus_box       = None
-    selecting_focus = False
+                use_custom = self.custom_bg.enabled
+                active_bg = self.background
 
-    ar_mode             = False
-    show_tracking_frame = False
+                if use_custom:
+                    cb = self.custom_bg.get_frame(frame.shape)
+                    if cb is not None:
+                        active_bg = cb
 
-    fps_counter = 0
-    fps_display = 0
-    fps_timer   = time.time()
+                active_portal = None
+                if use_custom:
+                    output = apply_virtual_background(frame, active_bg, soft_mask)
+                elif self.invisible_mode == "FULL":
+                    output = apply_full_invisibility(frame, active_bg, soft_mask)
+                elif self.invisible_mode == "BLUR":
+                    output = apply_background_blur(frame, soft_mask, self.blur_strength)
+                else:
+                    output = apply_portal_invisibility(frame, active_bg, portal, soft_mask)
+                    active_portal = portal
 
-    mp_selfie = mp.solutions.selfie_segmentation
+                if self.selecting_focus and len(self.focus_points) == 4:
+                    xs = [p[0] for p in self.focus_points]
+                    ys = [p[1] for p in self.focus_points]
+                    self.focus_box = (min(xs), min(ys), max(xs), max(ys))
+                    self.selecting_focus = False
+                    self.focus_mode = True
+                    self.renderer.push_toast("Focus region set")
 
-    with mp_selfie.SelfieSegmentation(model_selection=1) as segmenter:
-        while True:
-            ret, raw_frame = cap.read()
-            if not ret:
-                break
+                if self.focus_mode and self.focus_box:
+                    output = apply_focus_window(output, active_bg, self.focus_box)
 
-            raw_h, raw_w = raw_frame.shape[:2]
-            frame = cv2.flip(raw_frame, 1)
-            h, w  = frame.shape[:2]
+                if self.ar_mode:
+                    raw_corners = self.target_tracker.detect(raw_frame)
+                    corners = flip_corners_for_mirror(raw_corners, raw_w)
+                    if corners is not None:
+                        output = self.ar_renderer_obj.draw_target_overlay(output, corners)
+                        if self.show_tracking_frame:
+                            output = self.ar_renderer_obj.draw_tracking_frame(output, corners)
 
-            # ── FPS ───────────────────────────────────────────────────
-            fps_counter += 1
-            if time.time() - fps_timer >= 1.0:
-                fps_display = fps_counter
-                fps_counter = 0
-                fps_timer   = time.time()
+                if not self.canvas.draw_mode:
+                    output = self.renderer.draw_hands(output, hands, self.mp_hands_mod, self.mp_draw)
 
-            # ── Hand tracking ─────────────────────────────────────────
-            hands = hand_tracker.find_hands(frame)
+                if self.invisible_mode == "PORTAL" and not use_custom:
+                    output = self.renderer.draw_portal(output, active_portal)
 
-            triggered_gesture = None
+                if self.selecting_focus and self.focus_points:
+                    output = self.renderer.draw_focus_points(output, self.focus_points)
 
-            # ── Pose tracking (every 2nd frame) ───────────────────────
-            landmarks = pose_tracker.update(frame, every_n=2)
+                output = self.canvas.render(output, self.pose_tracker)
 
-            # ── Draw mode: handle gestures ────────────────────────────
-            if canvas.draw_mode:
-                pointing = gesture.pointing_hand(hands)
-                if pointing is not None:
-                    tip = pointing.landmark[8]
-                    canvas.pen_at(int(tip.x * w), int(tip.y * h))
-                elif gesture.fist_any(hands):
-                    canvas.pen_up()
-
-            else:
-                # ── Mode cycle (TWO-hand pinch only) ──────────────────
-                if gesture.two_hand_pinch_triggered(hands):
-                    mode_idx       = (mode_idx + 1) % len(MODES)
-                    invisible_mode = MODES[mode_idx]
-                    renderer.push_toast(f"Mode  {invisible_mode}")
-                    triggered_gesture = "PINCH"
-
-                # ── Focus selection (peace) ────────────────────────────
-                if gesture.peace_triggered(hands):
-                    if not selecting_focus:
-                        selecting_focus = True
-                        focus_points.clear()
-                        renderer.push_toast("Draw Focus Region — 4 clicks")
-                    triggered_gesture = "PEACE V"
-
-                if triggered_gesture:
-                    renderer.flash_gesture()
-
-                # ── Zoom (one-hand pinch, continuous) ─────────────────
-                if zoom_enabled:
-                    zoom_level = zoom_ctrl.update(hands)
+                if self.zoom_enabled:
+                    zoom_level = self.zoom_ctrl.level
+                    if zoom_level > 1.01:
+                        output = ZoomController.apply(output, zoom_level)
                 else:
                     zoom_level = 1.0
 
-            # ── Portal detection ──────────────────────────────────────
-            portal = portal_detector.detect(hands, frame.shape)
-
-            # ── Segmentation (only when needed) ──────────────────────
-            need_mask = (invisible_mode in ("FULL", "BLUR")
-                         or (invisible_mode == "PORTAL" and portal is not None)
-                         or custom_bg.enabled)
-
-            if need_mask:
-                hard_mask, soft_mask = make_person_mask(segmenter, frame)
-            else:
-                hard_mask = np.zeros((h, w), dtype=np.uint8)
-                soft_mask = np.zeros((h, w), dtype=np.float32)
-
-            # ── Resolve background ────────────────────────────────────
-            use_custom = custom_bg.enabled
-            active_bg  = background
-
-            if use_custom:
-                cb = custom_bg.get_frame(frame.shape)
-                if cb is not None:
-                    active_bg = cb
-
-            # ── Composite output ──────────────────────────────────────
-            active_portal = None
-
-            if use_custom:
-                # Custom BG = virtual background (person visible, BG replaced)
-                output = apply_virtual_background(frame, active_bg, soft_mask)
-
-            elif invisible_mode == "FULL":
-                output = apply_full_invisibility(frame, active_bg, soft_mask)
-
-            elif invisible_mode == "BLUR":
-                output = apply_background_blur(frame, soft_mask, blur_strength)
-
-            else:   # PORTAL
-                output = apply_portal_invisibility(
-                    frame, active_bg, portal, soft_mask
+                self.renderer.tick()
+                output = self.renderer.draw_hud(
+                    output, self.invisible_mode, active_portal,
+                    fps=self.fps_display, ar_mode=self.ar_mode, focus_mode=self.focus_mode,
+                    focus_box=self.focus_box, selecting=self.selecting_focus,
+                    gesture_name=triggered_gesture, zoom_level=zoom_level,
+                    vcam_active=self.vcam.enabled, custom_bg_name=self.custom_bg.source_name,
+                    draw_mode=self.canvas.draw_mode, canvas=self.canvas,
                 )
-                active_portal = portal
 
-            # ── Focus window ──────────────────────────────────────────
-            if selecting_focus and len(focus_points) == 4:
-                xs = [p[0] for p in focus_points]
-                ys = [p[1] for p in focus_points]
-                focus_box       = (min(xs), min(ys), max(xs), max(ys))
-                selecting_focus = False
-                focus_mode      = True
-                renderer.push_toast("Focus region set")
+                cv2.imshow("RealityFrame", output)
+                self.vcam.send(output)
 
-            if focus_mode and focus_box:
-                output = apply_focus_window(output, active_bg, focus_box)
+                key = cv2.waitKey(1) & 0xFF
 
-            # ── AR overlay ────────────────────────────────────────────
-            if ar_mode:
-                raw_corners = target_tracker.detect(raw_frame)
-                corners     = flip_corners_for_mirror(raw_corners, raw_w)
-                output      = ar_renderer_obj.draw_target_overlay(output, corners)
-                if show_tracking_frame:
-                    output = ar_renderer_obj.draw_tracking_frame(output, corners)
-
-            # ── Hand skeleton ─────────────────────────────────────────
-            if not canvas.draw_mode:
-                output = renderer.draw_hands(output, hands,
-                                             mp_hands_mod, mp_draw)
-
-            # ── Portal visual ─────────────────────────────────────────
-            if invisible_mode == "PORTAL" and not use_custom:
-                output = renderer.draw_portal(output, active_portal)
-
-            # ── Focus selection dots ───────────────────────────────────
-            if selecting_focus and focus_points:
-                output = renderer.draw_focus_points(output, focus_points)
-
-            # ── AR Canvas drawing ─────────────────────────────────────
-            output = canvas.render(output, pose_tracker)
-
-            # ── Zoom ──────────────────────────────────────────────────
-            if zoom_enabled:
-                zoom_level = zoom_ctrl.level
-                if zoom_level > 1.01:
-                    output = ZoomController.apply(output, zoom_level)
-            else:
-                zoom_level = 1.0
-
-            # ── HUD ───────────────────────────────────────────────────
-            renderer.tick()
-            output = renderer.draw_hud(
-                output, invisible_mode, active_portal,
-                fps            = fps_display,
-                ar_mode        = ar_mode,
-                focus_mode     = focus_mode,
-                focus_box      = focus_box,
-                selecting      = selecting_focus,
-                gesture_name   = triggered_gesture,
-                zoom_level     = zoom_level,
-                vcam_active    = vcam.enabled,
-                custom_bg_name = custom_bg.source_name,
-                draw_mode      = canvas.draw_mode,
-                canvas         = canvas,
-            )
-
-            cv2.imshow("RealityFrame", output)
-            vcam.send(output)
-
-            # ── Keyboard controls ─────────────────────────────────────
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q"):
-                break
-
-            elif key == ord("b"):
-                renderer.push_toast("Recapturing background…")
-                background_model.capture(cap, frames_count=180)
-                background = background_model.get()
-                invalidate_bg_cache()
-                renderer.push_toast("Background updated")
-
-            elif key == ord("f"):
-                if not canvas.draw_mode:
-                    if focus_box is not None:
-                        focus_mode = not focus_mode
-                        renderer.push_toast(
-                            "Focus ON" if focus_mode else "Focus OFF")
+                if key == ord("q"):
+                    break
+                elif key == ord("b"):
+                    self.renderer.push_toast("Recapturing background...")
+                    self.background_model.capture(self.cap, frames_count=180)
+                    self.background = self.background_model.get()
+                    invalidate_bg_cache()
+                    self.renderer.push_toast("Background updated")
+                elif key == ord("f"):
+                    if not self.canvas.draw_mode:
+                        if self.focus_box is not None:
+                            self.focus_mode = not self.focus_mode
+                            self.renderer.push_toast("Focus ON" if self.focus_mode else "Focus OFF")
+                        else:
+                            self.renderer.push_toast("No focus region - press R first")
+                elif key == ord("r"):
+                    if not self.canvas.draw_mode:
+                        self.focus_points.clear()
+                        self.focus_box = None
+                        self.focus_mode = False
+                        self.selecting_focus = True
+                        self.renderer.push_toast("Click 4 corners to set focus region")
+                elif key == ord("a"):
+                    if not self.canvas.draw_mode:
+                        self.ar_mode = not self.ar_mode
+                        self.renderer.push_toast("AR ON" if self.ar_mode else "AR OFF")
+                elif key == ord("v"):
+                    self.show_tracking_frame = not self.show_tracking_frame
+                elif key == ord("c"):
+                    if self.canvas.draw_mode:
+                        self.canvas.cycle_color()
+                        self.renderer.push_toast(f"Colour  {self.canvas.color_name}")
                     else:
-                        renderer.push_toast("No focus region — press R first")
+                        enabled = self.vcam.toggle()
+                        self.renderer.push_toast("Virtual Cam ON" if enabled else "Virtual Cam OFF")
+                elif key == ord("i"):
+                    if not self.bg_prompt_active and not self.canvas.draw_mode:
+                        self.bg_prompt_active = True
+                        threading.Thread(target=self._open_bg_picker, daemon=True).start()
+                elif key == ord("d"):
+                    self.canvas.toggle_draw_mode()
+                    self.renderer.push_toast("Draw Mode ON - point finger to draw" if self.canvas.draw_mode else "Draw Mode OFF")
+                elif key == ord("w"):
+                    if self.canvas.draw_mode:
+                        self.canvas.cycle_brush()
+                        self.renderer.push_toast(f"Brush  {self.canvas.brush_size}px")
+                elif key == ord("n"):
+                    if self.canvas.draw_mode:
+                        self.canvas.pen_up()
+                        ok = self.canvas.anchor_to_body(self.pose_tracker)
+                        self.renderer.push_toast("Sticker anchored to body!" if ok else "No body detected - stand in frame")
+                elif key == ord("u"):
+                    if self.canvas.draw_mode:
+                        self.canvas.undo()
+                elif key == ord("x"):
+                    if self.canvas.draw_mode:
+                        self.canvas.clear_all()
+                        self.renderer.push_toast("Canvas cleared")
+                elif key == ord("["):
+                    self.blur_strength = max(5, self.blur_strength - 10)
+                    self.renderer.push_toast(f"Blur  {self.blur_strength}")
+                elif key == ord("]"):
+                    self.blur_strength = min(101, self.blur_strength + 10)
+                    self.renderer.push_toast(f"Blur  {self.blur_strength}")
+                elif key == ord("z"):
+                    if self.zoom_ctrl.level > 1.05:
+                        self.zoom_ctrl.reset()
+                        self.renderer.push_toast("Zoom reset  1.0x")
+                    else:
+                        self.zoom_enabled = not self.zoom_enabled
+                        self.renderer.push_toast("Zoom enabled" if self.zoom_enabled else "Zoom disabled")
 
-            elif key == ord("r"):
-                if not canvas.draw_mode:
-                    focus_points.clear()
-                    focus_box       = None
-                    focus_mode      = False
-                    selecting_focus = True
-                    renderer.push_toast("Click 4 corners to set focus region")
-
-            elif key == ord("a"):
-                if not canvas.draw_mode:
-                    ar_mode = not ar_mode
-                    renderer.push_toast("AR ON" if ar_mode else "AR OFF")
-
-            elif key == ord("v"):
-                show_tracking_frame = not show_tracking_frame
-
-            # ── Virtual Camera ────────────────────────────────────────
-            elif key == ord("c"):
-                if canvas.draw_mode:
-                    canvas.cycle_color()
-                    renderer.push_toast(f"Colour  {canvas.color_name}")
-                else:
-                    enabled = vcam.toggle()
-                    renderer.push_toast(
-                        "Virtual Cam ON" if enabled else "Virtual Cam OFF")
-
-            # ── Custom Background ─────────────────────────────────────
-            elif key == ord("i"):
-                if not _bg_prompt_active and not canvas.draw_mode:
-                    _bg_prompt_active = True
-                    def _run():
-                        global _bg_prompt_active
-                        _open_bg_picker(custom_bg, renderer)
-                        _bg_prompt_active = False
-                    threading.Thread(target=_run, daemon=True).start()
-
-            # ── Draw Mode ────────────────────────────────────────────
-            elif key == ord("d"):
-                canvas.toggle_draw_mode()
-                renderer.push_toast(
-                    "Draw Mode ON — point finger to draw"
-                    if canvas.draw_mode
-                    else "Draw Mode OFF"
-                )
-
-            # ── Draw mode: brush size (W) ────────────────────────────
-            elif key == ord("w"):
-                if canvas.draw_mode:
-                    canvas.cycle_brush()
-                    renderer.push_toast(f"Brush  {canvas.brush_size}px")
-
-            # ── Draw mode: anchor to body (N) ────────────────────────
-            elif key == ord("n"):
-                if canvas.draw_mode:
-                    canvas.pen_up()
-                    ok = canvas.anchor_to_body(pose_tracker)
-                    renderer.push_toast(
-                        "Sticker anchored to body!" if ok
-                        else "No body detected — stand in frame"
-                    )
-
-            # ── Draw mode: undo (U) ───────────────────────────────────
-            elif key == ord("u"):
-                if canvas.draw_mode:
-                    canvas.undo()
-
-            # ── Draw mode: clear (X) ──────────────────────────────────
-            elif key == ord("x"):
-                if canvas.draw_mode:
-                    canvas.clear_all()
-                    renderer.push_toast("Canvas cleared")
-
-            # ── Blur strength ─────────────────────────────────────────
-            elif key == ord("["):
-                blur_strength = max(5, blur_strength - 10)
-                renderer.push_toast(f"Blur  {blur_strength}")
-
-            elif key == ord("]"):
-                blur_strength = min(101, blur_strength + 10)
-                renderer.push_toast(f"Blur  {blur_strength}")
-
-            # ── Zoom toggle ───────────────────────────────────────────
-            elif key == ord("z"):
-                if zoom_ctrl.level > 1.05:
-                    zoom_ctrl.reset()
-                    renderer.push_toast("Zoom reset  1.0×")
-                else:
-                    zoom_enabled = not zoom_enabled
-                    renderer.push_toast(
-                        "Zoom enabled" if zoom_enabled else "Zoom disabled")
-
-    cap.release()
-    pose_tracker.close()
-    cv2.destroyAllWindows()
+        self.vcam.close()
+        self.cap.release()
+        self.pose_tracker.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="RealityFrame AR Application")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index to use")
+    args = parser.parse_args()
+
+    try:
+        app = RealityFrameApp(camera_index=args.camera)
+        app.run()
+    except RuntimeError as e:
+        print(f"Error: {e}")
