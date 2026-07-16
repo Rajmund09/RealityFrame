@@ -16,6 +16,9 @@ If pyvirtualcam is not installed the class still loads but is a no-op.
 """
 
 import numpy as np
+import threading
+import queue
+import time
 
 try:
     import pyvirtualcam
@@ -28,6 +31,7 @@ class VirtualCamOutput:
     """
     Thin, safe wrapper around pyvirtualcam.Camera.
     Degrades gracefully when the library or driver is absent.
+    Uses a background thread to prevent blocking the main pipeline.
     """
 
     def __init__(self, width: int, height: int, fps: int = 30):
@@ -36,6 +40,10 @@ class VirtualCamOutput:
         self._fps     = fps
         self._cam     = None
         self._enabled = False
+        
+        self._frame_queue = queue.Queue(maxsize=2)
+        self._running = True
+        self._thread = None
 
         if not _AVAILABLE:
             print(
@@ -60,15 +68,18 @@ class VirtualCamOutput:
         """Send one BGR frame to the virtual camera (non-blocking)."""
         if not self._enabled or self._cam is None:
             return
+        
+        # Put the frame in the queue. If it's full, just drop the oldest.
         try:
-            # pyvirtualcam expects RGB
-            rgb = frame_bgr[:, :, ::-1].copy()
-            self._cam.send(rgb)
-            self._cam.sleep_until_next_frame()
-        except Exception:
-            # Driver disconnected — disable silently
-            self._enabled = False
-            self._cam = None
+            self._frame_queue.put_nowait(frame_bgr)
+        except queue.Full:
+            try:
+                self._frame_queue.get_nowait()
+                self._frame_queue.put_nowait(frame_bgr)
+            except queue.Empty:
+                pass
+            except queue.Full:
+                pass
 
     @property
     def enabled(self) -> bool:
@@ -79,6 +90,27 @@ class VirtualCamOutput:
         return _AVAILABLE
 
     # ── Internal ──────────────────────────────────────────────────────
+    
+    def _worker(self):
+        while self._running:
+            if not self._enabled or self._cam is None:
+                time.sleep(0.01)
+                continue
+                
+            try:
+                frame_bgr = self._frame_queue.get(timeout=0.1)
+                rgb = frame_bgr[:, :, ::-1].copy()
+                self._cam.send(rgb)
+                self._cam.sleep_until_next_frame()
+            except queue.Empty:
+                pass
+            except Exception as e:
+                # Driver disconnected or error
+                print(f"[VirtualCam] Error sending frame: {e}")
+                self._enabled = False
+                if self._cam:
+                    self._cam.close()
+                self._cam = None
 
     def _start(self):
         try:
@@ -89,6 +121,13 @@ class VirtualCamOutput:
                 fmt=pyvirtualcam.PixelFormat.RGB,
             )
             self._enabled = True
+            
+            # Start worker thread if not already running
+            if self._thread is None or not self._thread.is_alive():
+                self._running = True
+                self._thread = threading.Thread(target=self._worker, daemon=True)
+                self._thread.start()
+                
             print(f"[VirtualCam] Streaming to: {self._cam.device}")
         except Exception as exc:
             print(f"[VirtualCam] Could not start: {exc}")
@@ -96,14 +135,30 @@ class VirtualCamOutput:
             self._cam = None
 
     def _stop(self):
+        self._enabled = False
+        # The worker thread will idle.
         if self._cam:
             try:
                 self._cam.close()
             except Exception:
                 pass
-        self._cam     = None
-        self._enabled = False
+        self._cam = None
+        
+        # Clear the queue
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+                
         print("[VirtualCam] Stopped.")
 
-    def __del__(self):
+    def close(self):
+        """Fully clean up the worker thread."""
+        self._running = False
         self._stop()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def __del__(self):
+        self.close()
